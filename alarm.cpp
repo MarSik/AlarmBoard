@@ -17,6 +17,8 @@
 #define sbi(port, bit) (port) |= _BV((bit))
 #define cbi(port, bit) (port) &= ~(_BV((bit)))
 
+#define FADE_STEP 0x200
+
 uint16_t leds[2][16] = {
     {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
     {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
@@ -25,7 +27,9 @@ uint16_t leds[2][16] = {
 volatile struct _ledstatus {
     uint8_t active:1;
     uint8_t changed:1;
-} ledstatus = {0, 0};
+    uint8_t blink:1;
+    uint8_t fade:1;
+} ledstatus = {0, 1};
 
 volatile struct _serialstate {
     uint8_t nothing:1;
@@ -53,14 +57,22 @@ int main(void)
     sbi(LEDCTRL, DCPRG);
     cbi(LEDCTRL, VPRG);
 
-    // set timer1 to control BLANK signal
-    TCCR1A = 0; // no external timer output, CTC mode
-    TCCR1B = _BV(WGM12) | _BV(CS10); // internal clock, no prescaler, CTC, TOP is OCR1A
+    // set timer0 to control BLANK signal
+    TCCR0A = _BV(WGM01); // no external timer output, CTC mode
+    TCCR0B = _BV(CS01) | _BV(CS00); // internal clock, prescaler 64, TOP is OCR0A
     
-    OCR1AH = 0x0f;
-    OCR1AL = 0xff; // 4096 steps
+    OCR0A = 64; // 4096 ticks
 
-    TIMSK = _BV(OCIE1A); // INT when OCR1A is matched
+    // set timer1 to control blinking and fade
+    TCCR1A = 0; // disconnected from port
+    TCCR1B = _BV(WGM12) | _BV(CS12) | _BV(CS10); // internal clock, 1024 prescaler, CTC, top OCR1A
+
+    OCR1AH = 0x1e;
+    OCR1AL = 0x84; // 7812 * 1024 cycles = 1Hz at 8Mhz clock
+
+    // set interrupts
+    TIMSK = _BV(OCIE0A) | _BV(OCIE1A); // INT when OCR1A is matched
+
 
     // set USART to 9600baud, 8N1, RX interrupt
     UBRRH = 0;
@@ -95,7 +107,12 @@ ISR(USART_RX_vect)
 
     switch(serialStatus.state){
     case 0:
+        ledstatus.blink = 0;
+        ledstatus.fade = 0;
+
         if(data==0xff) serialStatus.state++;
+        else if(data==0xfb) ledstatus.blink = 1;
+        else if(data==0xfe) ledstatus.fade = 1;
         else if(data==0xfc) ledstatus.changed = 1;
         else if(data==0xfd) ledstatus.active ^= 1;
         else if(data==0xf0) memset(leds[ledstatus.active], 0, 64);         
@@ -116,7 +133,7 @@ ISR(USART_RX_vect)
     }
 }
 
-ISR(TIMER1_COMPA_vect)
+ISR(TIMER0_COMPA_vect)
 {
     // cycle blank pin
     sbi(PINB, BLANK);
@@ -132,5 +149,33 @@ ISR(TIMER1_COMPA_vect)
         // latch data to driver
         sbi(PINB, XLAT);
         sbi(PINB, XLAT);
+    }
+}
+
+ISR(TIMER1_COMPA_vect)
+{
+    if(ledstatus.blink){
+        ledstatus.active ^= 1;
+        ledstatus.changed = 1;
+    }
+
+    if(ledstatus.fade){
+        uint8_t led;
+        uint8_t nochange = 0;
+
+        for(led=0; led<16; led++){
+            if(leds[ledstatus.active][led] < leds[ledstatus.active ^ 1][led]){
+                if(leds[ledstatus.active ^ 1][led] - leds[ledstatus.active][led] > FADE_STEP) leds[ledstatus.active][led]+=FADE_STEP;
+                else leds[ledstatus.active][led] = leds[ledstatus.active ^ 1][led];
+            }
+            else if(leds[ledstatus.active][led] > leds[ledstatus.active ^ 1][led]){
+                if(leds[ledstatus.active][led] - leds[ledstatus.active ^ 1][led] > FADE_STEP) leds[ledstatus.active][led]-=FADE_STEP;
+                else leds[ledstatus.active][led] = leds[ledstatus.active ^ 1][led];
+            }
+            else nochange++;
+        }
+
+        if(nochange==16) ledstatus.fade = 0;
+        else ledstatus.changed = 1;
     }
 }
